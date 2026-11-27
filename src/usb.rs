@@ -288,9 +288,11 @@ fn read_device_id(h: &rusb::DeviceHandle<GlobalContext>, iface: Iface) -> rusb::
     Ok(parse_device_id(&buf[..n]))
 }
 
-/// FNV-1a over the serial, 48 bits as 12 hex digits. Stable across Rust versions, unlike
+/// The key a printer with this serial number gets: FNV-1a over the serial, 48 bits
+/// as 12 hex digits. Public so an app can match a network printer (whose web page
+/// shows its serial) to the same printer on USB. Stable across Rust versions, unlike
 /// `std`'s `DefaultHasher`.
-fn key_of(serial: &str) -> String {
+pub fn key_of(serial: &str) -> String {
     let h = serial.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
         (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
     });
