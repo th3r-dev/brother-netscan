@@ -1,0 +1,30 @@
+{
+  "schema": "rust-anything/bridge@1",
+  "root": "..",
+  "unit": "rle.py",
+  "language": "python",
+  "kind": "pyo3",
+  "crate_name": "rle-rs",
+  "exports": [
+    {
+      "name": "rle_decode",
+      "file": "rle.py",
+      "line": 4,
+      "params": [
+        {
+          "name": "data",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "pybytes",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    }
+  ],
+  "classes": [],
+  "js_only": []
+}

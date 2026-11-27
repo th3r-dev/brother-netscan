@@ -1,0 +1,12 @@
+[package]
+name = "brother-netscan"
+version = "0.1.0"
+edition = "2024"
+description = "Scan from Brother network scanners over their proprietary protocol (TCP 54921), no driver needed"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/th3r-dev/brother-netscan"
+keywords = ["scanner", "brother", "brscan", "scan"]
+categories = ["command-line-utilities", "multimedia::images"]
+exclude = ["parity/"]
+
+[dependencies]
