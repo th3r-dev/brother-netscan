@@ -3,7 +3,18 @@ Copyright (c) 2026 th3r-dev and brother-netscan contributors
 Licensed under the MIT License or the Apache License 2.0, at your option.
 
 This project ports parts of brother-scand to Rust:
-https://github.com/pietern/brother-scand (fork: https://github.com/darsto/brother-scand)
+https://github.com/pietern/brother-scand (fork of https://github.com/darsto/brother-scand)
+
+  - data_channel.c: write_scan_params, data_channel_send_scan_params,
+    exchange_params2 -> src/lib.rs command(), the ESC I / ESC X requests and
+    parse_i_reply()
+  - data_channel.c: data_channel_init_connection -> the greeting check in scan_to()
+  - data_channel.c: process_header, process_chunk_header,
+    process_page_end_header, process_scan_end_header (pietern), and the
+    single-byte status case in process_header (darsto) -> receive()
+  - config.c: default scan parameters (B, N, D, G, L, C, M) -> the ESC X fields
+  - rle_to_tiff.py: rle_decode -> PackBits::feed; also copied unchanged except
+    for added type hints into parity/rle/rle.py as the recorded original
 
     MIT License
 
