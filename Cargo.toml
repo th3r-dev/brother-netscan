@@ -9,4 +9,9 @@ keywords = ["scanner", "brother", "brscan", "scan"]
 categories = ["command-line-utilities", "multimedia::images"]
 exclude = ["parity/"]
 
+[features]
+# Scan, status and printing over a USB cable (rusb with a static, vendored libusb).
+usb = ["dep:rusb"]
+
 [dependencies]
+rusb = { version = "0.9", features = ["vendored"], optional = true }

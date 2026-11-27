@@ -1,9 +1,12 @@
 //! Scan one flatbed page from a Brother network scanner over Brother's proprietary
 //! protocol on TCP 54921 (the one brscan3/brscan4 use), with no driver installed.
 //!
-//! Stdlib only. Gray scans come back as binary PGM (decoded from the scanner's PackBits
-//! stream), color scans as the JPEG the scanner produces. Set `BROTHER_NETSCAN_DEBUG=1`
-//! to log the exchange to stderr.
+//! Stdlib only by default. Gray scans come back as binary PGM (decoded from the scanner's
+//! PackBits stream), color scans as the JPEG the scanner produces. Set
+//! `BROTHER_NETSCAN_DEBUG=1` to log the exchange to stderr.
+//!
+//! The protocol itself runs over any byte stream ([`scan_over`], [`probe_over`]). With the
+//! `usb` feature, [`usb`] drives the same protocol over a USB cable.
 //!
 //! ```no_run
 //! let opts = brother_netscan::ScanOptions::default(); // 300 dpi gray
@@ -17,6 +20,9 @@ use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use std::time::Duration;
+
+#[cfg(feature = "usb")]
+pub mod usb;
 
 /// TCP port of the scan service.
 pub const PORT: u16 = 54921;
@@ -129,9 +135,10 @@ pub struct ScanInfo {
 /// Why a scan failed.
 #[derive(Debug)]
 pub enum ScanError {
-    /// Network trouble: refused, unreachable, timed out, connection dropped.
+    /// Transport trouble: refused, unreachable, timed out, connection or cable dropped.
     Io(io::Error),
     /// The scanner answered `-NG ...` instead of `+OK 200` (`-NG 401`: another scan holds it).
+    /// Over USB: another program holds the scanner interface, or the session was refused.
     Busy(String),
     /// The scanner sent this status byte where image data should start.
     DeviceStatus(u8),
@@ -194,11 +201,11 @@ impl From<ScanError> for io::Error {
     }
 }
 
-fn debug() -> bool {
+pub(crate) fn debug() -> bool {
     std::env::var_os("BROTHER_NETSCAN_DEBUG").is_some()
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter()
         .map(|x| format!("{x:02x}"))
         .collect::<Vec<_>>()
@@ -230,7 +237,7 @@ pub fn probe(host: &str, mode: Mode) -> Result<Vec<Supported>, ScanError> {
     let mut out = Vec::new();
     for dpi in Dpi::ALL {
         let mut s = connect(host)?;
-        match negotiate(&mut s, ScanOptions { dpi, mode }) {
+        match negotiate(&mut s, ScanOptions { dpi, mode }, tcp_timeout) {
             Ok(plan) => out.push(Supported {
                 dpi,
                 scanned: (plan.xdpi, plan.ydpi),
@@ -255,13 +262,63 @@ struct Plan {
 /// Scan one flatbed page, streaming the image file (PGM or JPEG) into `out`.
 pub fn scan_to<W: Write>(host: &str, opts: ScanOptions, out: W) -> Result<ScanInfo, ScanError> {
     let mut s = connect(host)?;
+    let info = scan_core(&mut s, opts, out, tcp_timeout)?;
+    let _ = s.shutdown(std::net::Shutdown::Both);
+    Ok(info)
+}
+
+/// [`scan_to`] over a stream that is already past its transport's handshake: steps 2 to 6
+/// of the protocol (ESC I, ESC X, image records), for transports other than TCP.
+///
+/// Every read on `stream` must time out on its own (the scanner can stay silent for about
+/// 20 s while the lamp warms up and the head travels; 60 s is a safe limit), or a dead
+/// scanner blocks forever. A `TimedOut` or `WouldBlock` read error after part of the
+/// ESC I reply has arrived ends that reply.
+pub fn scan_over<S: Read + Write, W: Write>(
+    stream: &mut S,
+    opts: ScanOptions,
+    out: W,
+) -> Result<ScanInfo, ScanError> {
+    scan_core(stream, opts, out, |_, _| Ok(()))
+}
+
+/// Negotiates `opts` once on a stream past its handshake (ESC I only, the head doesn't
+/// move) and returns what the scanner would scan at. A resolution it won't do fails with
+/// [`ScanError::UnsupportedResolution`]. The stream should then be closed: [`probe`]
+/// opens one connection per resolution, and USB one session per resolution.
+pub fn probe_over<S: Read + Write>(
+    stream: &mut S,
+    opts: ScanOptions,
+) -> Result<Supported, ScanError> {
+    let plan = negotiate(stream, opts, |_, _| Ok(()))?;
+    Ok(Supported {
+        dpi: opts.dpi,
+        scanned: (plan.xdpi, plan.ydpi),
+    })
+}
+
+/// Sets a stream's read timeout. TCP shortens it for the pieces of the ESC I reply and
+/// lengthens it for the image data; [`scan_over`] leaves timeouts to its caller.
+pub(crate) type SetTimeout<S> = fn(&mut S, Duration) -> io::Result<()>;
+
+fn tcp_timeout(s: &mut TcpStream, d: Duration) -> io::Result<()> {
+    s.set_read_timeout(Some(d))
+}
+
+/// Steps 2 to 6 on any stream: negotiate, start the scan, receive the records.
+pub(crate) fn scan_core<S: Read + Write, W: Write>(
+    s: &mut S,
+    opts: ScanOptions,
+    out: W,
+    set_timeout: SetTimeout<S>,
+) -> Result<ScanInfo, ScanError> {
     let Plan {
         xdpi,
         ydpi,
         width,
         height,
         xrep,
-    } = negotiate(&mut s, opts)?;
+    } = negotiate(s, opts, set_timeout)?;
     let mode = mode_name(opts.mode);
 
     // 3. ESC X: start the scan over the whole area, at exactly what the scanner offered.
@@ -270,20 +327,19 @@ pub fn scan_to<W: Write>(host: &str, opts: ScanOptions, out: W) -> Result<ScanIn
         Mode::Color => "JPEG",
     };
     send(
-        &mut s,
+        s,
         &command(&format!(
             "X\nR={xdpi},{ydpi}\nM={mode}\nC={comp}\nJ=MID\nB=50\nN=50\nA=0,0,{width},{height}\nD=SIN\nG=1\nL=128\n"
         )),
     )?;
 
     // 4. Image records until the end marker.
-    s.set_read_timeout(Some(DATA_TIMEOUT))?;
+    set_timeout(s, DATA_TIMEOUT)?;
     let mut sink = Sink::new(out, width as usize, height as usize, xrep);
-    receive(&mut s, &mut sink).map_err(|e| match e {
+    receive(s, &mut sink).map_err(|e| match e {
         ScanError::Io(e) => ctx(e, "receiving image data"),
         e => e,
     })?;
-    let _ = s.shutdown(std::net::Shutdown::Both);
     let ext = sink.finish()?;
     Ok(ScanInfo {
         ext,
@@ -338,11 +394,15 @@ fn connect(host: &str) -> Result<TcpStream, ScanError> {
 }
 
 /// Step 2, ESC I: ask what the scanner will do for this resolution and mode.
-fn negotiate(s: &mut TcpStream, opts: ScanOptions) -> Result<Plan, ScanError> {
+fn negotiate<S: Read + Write>(
+    s: &mut S,
+    opts: ScanOptions,
+    set_timeout: SetTimeout<S>,
+) -> Result<Plan, ScanError> {
     let mode = mode_name(opts.mode);
     let req = opts.dpi.value();
     send(s, &command(&format!("I\nR={req},{req}\nM={mode}\n")))?;
-    let reply = read_i_reply(s).map_err(|e| ctx(e, "waiting for the ESC I reply"))?;
+    let reply = read_i_reply(s, set_timeout).map_err(|e| ctx(e, "waiting for the ESC I reply"))?;
     if debug() {
         eprintln!("< [{}]", hex(&reply));
     }
@@ -397,7 +457,7 @@ fn command(body: &str) -> Vec<u8> {
     v
 }
 
-fn send(s: &mut TcpStream, b: &[u8]) -> Result<(), ScanError> {
+fn send(s: &mut impl Write, b: &[u8]) -> Result<(), ScanError> {
     if debug() {
         eprintln!("> {:?}", String::from_utf8_lossy(b));
     }
@@ -416,7 +476,7 @@ fn read_line(r: &mut impl Read) -> io::Result<Vec<u8>> {
 
 /// Reads the ESC I reply, which may arrive in more than one packet. It ends with a NUL on
 /// the devices seen so far; without one, a short pause after some data ends it.
-fn read_i_reply(s: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn read_i_reply<S: Read>(s: &mut S, set_timeout: SetTimeout<S>) -> io::Result<Vec<u8>> {
     let (mut reply, mut buf) = (Vec::new(), [0u8; 256]);
     loop {
         match s.read(&mut buf) {
@@ -438,9 +498,9 @@ fn read_i_reply(s: &mut TcpStream) -> io::Result<Vec<u8>> {
         if digits.is_some_and(|d| reply[d..].contains(&0)) || reply.len() >= 256 {
             break;
         }
-        s.set_read_timeout(Some(PIECE_TIMEOUT))?;
+        set_timeout(s, PIECE_TIMEOUT)?;
     }
-    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    set_timeout(s, REPLY_TIMEOUT)?;
     Ok(reply)
 }
 
@@ -707,6 +767,76 @@ mod tests {
         );
         assert!(parse_i_reply(b"\x00\x03\x00300").is_none());
         assert_eq!(command("I\nR=300,300\n"), b"\x1bI\nR=300,300\n\x80");
+    }
+
+    /// A scanner on the other end of a stream: each read gets (part of) the next reply,
+    /// like separate packets; what was sent is recorded.
+    struct Fake {
+        replies: std::collections::VecDeque<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+
+    impl Fake {
+        fn new(replies: &[&[u8]]) -> Self {
+            Fake {
+                replies: replies.iter().map(|r| r.to_vec()).collect(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for Fake {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            let Some(r) = self.replies.front_mut() else {
+                return Ok(0);
+            };
+            let n = b.len().min(r.len());
+            b[..n].copy_from_slice(&r[..n]);
+            r.drain(..n);
+            if r.is_empty() {
+                self.replies.pop_front();
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for Fake {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.sent.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runs_the_protocol_over_any_stream() {
+        // ESC I reply for a 2x1 area at 300 dpi, then one raw gray row and the job end.
+        let mut data = rec12(0x40, &[0x11, 0x22]);
+        data.push(0x80);
+        let mut s = Fake::new(&[b"\x00\x1b\x00300,300,2,1,2,1,1,\x00", &data]);
+        let mut img = Vec::new();
+        let info = scan_over(&mut s, ScanOptions::default(), &mut img).unwrap();
+        assert_eq!((info.ext, info.width, info.height), ("pgm", 2, 1));
+        assert_eq!(img, b"P5\n2 1\n255\n\x11\x22");
+        let sent = String::from_utf8_lossy(&s.sent);
+        assert!(sent.starts_with("\x1bI\nR=300,300\nM=GRAY64\n"));
+        assert!(sent.contains("\x1bX\nR=300,300\nM=GRAY64\nC=RLENGTH\n"));
+        assert!(sent.contains("A=0,0,2,1\n"));
+
+        let mut s = Fake::new(&[b"\x00\x1b\x00600,600,2,209,4960,291,6874,\x00"]);
+        let opts = ScanOptions {
+            dpi: Dpi::D800,
+            mode: Mode::Gray,
+        };
+        assert!(matches!(
+            probe_over(&mut s, opts),
+            Err(ScanError::UnsupportedResolution {
+                requested: 800,
+                offered: (600, 600)
+            })
+        ));
     }
 
     #[test]
