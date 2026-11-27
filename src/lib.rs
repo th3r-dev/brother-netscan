@@ -213,8 +213,95 @@ pub fn scan(host: &str, opts: ScanOptions) -> Result<(Vec<u8>, &'static str), Sc
     Ok((out, info.ext))
 }
 
+/// A resolution the scanner accepts, and how it delivers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Supported {
+    /// The selectable value.
+    pub dpi: Dpi,
+    /// What the scanner actually scans at (x, y). `(600, 1200)` for 1200 means the
+    /// optics stop at 600 across, and each row is widened to make square pixels.
+    pub scanned: (u32, u32),
+}
+
+/// Ask the scanner which of [`Dpi::ALL`] it accepts in `mode`, without scanning: for
+/// each value it negotiates the resolution, then hangs up before the head moves.
+/// Takes a second or two per value.
+pub fn probe(host: &str, mode: Mode) -> Result<Vec<Supported>, ScanError> {
+    let mut out = Vec::new();
+    for dpi in Dpi::ALL {
+        let mut s = connect(host)?;
+        match negotiate(&mut s, ScanOptions { dpi, mode }) {
+            Ok(plan) => out.push(Supported {
+                dpi,
+                scanned: (plan.xdpi, plan.ydpi),
+            }),
+            Err(ScanError::UnsupportedResolution { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+    Ok(out)
+}
+
+/// What the scanner agreed to in step 2.
+struct Plan {
+    xdpi: u32,
+    ydpi: u32,
+    width: u32,
+    height: u32,
+    xrep: usize,
+}
+
 /// Scan one flatbed page, streaming the image file (PGM or JPEG) into `out`.
 pub fn scan_to<W: Write>(host: &str, opts: ScanOptions, out: W) -> Result<ScanInfo, ScanError> {
+    let mut s = connect(host)?;
+    let Plan {
+        xdpi,
+        ydpi,
+        width,
+        height,
+        xrep,
+    } = negotiate(&mut s, opts)?;
+    let mode = mode_name(opts.mode);
+
+    // 3. ESC X: start the scan over the whole area, at exactly what the scanner offered.
+    let comp = match opts.mode {
+        Mode::Gray => "RLENGTH",
+        Mode::Color => "JPEG",
+    };
+    send(
+        &mut s,
+        &command(&format!(
+            "X\nR={xdpi},{ydpi}\nM={mode}\nC={comp}\nJ=MID\nB=50\nN=50\nA=0,0,{width},{height}\nD=SIN\nG=1\nL=128\n"
+        )),
+    )?;
+
+    // 4. Image records until the end marker.
+    s.set_read_timeout(Some(DATA_TIMEOUT))?;
+    let mut sink = Sink::new(out, width as usize, height as usize, xrep);
+    receive(&mut s, &mut sink).map_err(|e| match e {
+        ScanError::Io(e) => ctx(e, "receiving image data"),
+        e => e,
+    })?;
+    let _ = s.shutdown(std::net::Shutdown::Both);
+    let ext = sink.finish()?;
+    Ok(ScanInfo {
+        ext,
+        width: width * xrep as u32,
+        height,
+        scanned_dpi: (xdpi, ydpi),
+    })
+}
+
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Gray => "GRAY64",
+        Mode::Color => "CGRAY",
+    }
+}
+
+/// Connects and reads the greeting (step 1).
+fn connect(host: &str) -> Result<TcpStream, ScanError> {
     let addr = (host, PORT)
         .to_socket_addrs()?
         .next()
@@ -247,15 +334,15 @@ pub fn scan_to<W: Write>(host: &str, opts: ScanOptions, out: W) -> Result<ScanIn
     if !greet.starts_with('+') {
         return Err(ScanError::Protocol(format!("greeting {greet:?}")));
     }
+    Ok(s)
+}
 
-    // 2. ESC I: ask what the scanner will do for this resolution and mode.
-    let mode = match opts.mode {
-        Mode::Gray => "GRAY64",
-        Mode::Color => "CGRAY",
-    };
+/// Step 2, ESC I: ask what the scanner will do for this resolution and mode.
+fn negotiate(s: &mut TcpStream, opts: ScanOptions) -> Result<Plan, ScanError> {
+    let mode = mode_name(opts.mode);
     let req = opts.dpi.value();
-    send(&mut s, &command(&format!("I\nR={req},{req}\nM={mode}\n")))?;
-    let reply = read_i_reply(&mut s).map_err(|e| ctx(e, "waiting for the ESC I reply"))?;
+    send(s, &command(&format!("I\nR={req},{req}\nM={mode}\n")))?;
+    let reply = read_i_reply(s).map_err(|e| ctx(e, "waiting for the ESC I reply"))?;
     if debug() {
         eprintln!("< [{}]", hex(&reply));
     }
@@ -279,33 +366,12 @@ pub fn scan_to<W: Write>(host: &str, opts: ScanOptions, out: W) -> Result<ScanIn
             });
         }
     };
-
-    // 3. ESC X: start the scan over the whole area, at exactly what the scanner offered.
-    let comp = match opts.mode {
-        Mode::Gray => "RLENGTH",
-        Mode::Color => "JPEG",
-    };
-    send(
-        &mut s,
-        &command(&format!(
-            "X\nR={xdpi},{ydpi}\nM={mode}\nC={comp}\nJ=MID\nB=50\nN=50\nA=0,0,{width},{height}\nD=SIN\nG=1\nL=128\n"
-        )),
-    )?;
-
-    // 4. Image records until the end marker.
-    s.set_read_timeout(Some(DATA_TIMEOUT))?;
-    let mut sink = Sink::new(out, width as usize, height as usize, xrep);
-    receive(&mut s, &mut sink).map_err(|e| match e {
-        ScanError::Io(e) => ctx(e, "receiving image data"),
-        e => e,
-    })?;
-    let _ = s.shutdown(std::net::Shutdown::Both);
-    let ext = sink.finish()?;
-    Ok(ScanInfo {
-        ext,
-        width: width * xrep as u32,
+    Ok(Plan {
+        xdpi,
+        ydpi,
+        width,
         height,
-        scanned_dpi: (xdpi, ydpi),
+        xrep,
     })
 }
 

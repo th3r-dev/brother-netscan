@@ -5,11 +5,11 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::process::exit;
 
-const USAGE: &str = "usage: brother-netscan <host> [--dpi 200|300|400|600|800|1200] [--mode gray|color] --out page.<ext>";
+const USAGE: &str = "usage: brother-netscan <host> [--dpi 200|300|400|600|800|1200] [--mode gray|color] --out page.<ext>\n       brother-netscan <host> --probe [--mode gray|color]   list the resolutions the scanner accepts";
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut host, mut out, mut opts) = (None, None, ScanOptions::default());
+    let (mut host, mut out, mut opts, mut probe) = (None, None, ScanOptions::default(), false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dpi" => {
@@ -27,9 +27,27 @@ fn main() {
                 }
             }
             "--out" => out = args.next(),
+            "--probe" => probe = true,
             "-h" | "--help" => die(USAGE),
             _ if host.is_none() && !a.starts_with('-') => host = Some(a),
             _ => die(USAGE),
+        }
+    }
+    if let (Some(host), true) = (&host, probe) {
+        match brother_netscan::probe(host, opts.mode) {
+            Ok(list) => {
+                for s in list {
+                    let (x, y) = s.scanned;
+                    let note = if x == y {
+                        String::new()
+                    } else {
+                        format!(" (scans {x}x{y}, widened)")
+                    };
+                    println!("{}{note}", s.dpi);
+                }
+                return;
+            }
+            Err(e) => die(&format!("probe failed: {e}")),
         }
     }
     let (Some(host), Some(out)) = (host, out) else {

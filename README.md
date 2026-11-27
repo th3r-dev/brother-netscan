@@ -14,9 +14,12 @@ cargo install --git https://github.com/th3r-dev/brother-netscan
 brother-netscan 192.0.2.10 --out page                       # 300 dpi gray → page.pgm
 brother-netscan 192.0.2.10 --dpi 600 --out page             # 600 dpi gray
 brother-netscan 192.0.2.10 --mode color --out page          # 300 dpi color → page.jpg
+brother-netscan 192.0.2.10 --probe                          # resolutions this scanner accepts
 sips -s format png page.pgm --out page.png                   # macOS: PGM to PNG
-tesseract page.pgm page -l eng                               # OCR straight from the PGM
+tesseract page.pgm page --dpi 300 -l eng                     # OCR at the scan's real DPI
 ```
+
+PGM files carry no resolution, so pass the scan's DPI to Tesseract with `--dpi`. Without it, Tesseract guesses.
 
 ```rust
 use brother_netscan::{scan, scan_to, Dpi, Mode, ScanOptions};
@@ -29,6 +32,8 @@ let opts = ScanOptions { dpi: Dpi::D600, mode: Mode::Gray };
 let info = scan_to("192.0.2.10", opts, std::io::BufWriter::new(std::fs::File::create("page.pgm")?))?;
 println!("{}x{} px", info.width, info.height);
 ```
+
+`probe(host, mode)` lists the resolutions the scanner accepts, without scanning. It negotiates each value and hangs up before the head moves, which takes a second or two per value. On a DCP-1610W it returns 200, 300, 400, 600 and 1200 for gray (1200 is scanned at 600 × 1200, then widened), and 200 to 600 for color.
 
 Set `BROTHER_NETSCAN_DEBUG=1` to log the exchange with the scanner to stderr.
 
