@@ -108,34 +108,31 @@ impl UsbPrinter {
         if printer.is_none() && scanner.is_none() {
             return None;
         }
-        let handle = device.open().ok();
-        let read = |f: fn(
-            &rusb::DeviceHandle<GlobalContext>,
-            &rusb::DeviceDescriptor,
-        ) -> rusb::Result<String>| {
-            handle.as_ref().and_then(|h| f(h, &desc).ok())
-        };
-        let serial = read(|h, d| h.read_serial_number_string_ascii(d));
-        let product = read(|h, d| h.read_product_string_ascii(d));
-        drop(handle);
-        let mut p =
-            UsbPrinter {
-                device,
-                model: product.unwrap_or_else(|| format!("USB device {:04x}", desc.product_id())),
-                // ponytail: two printers without serial numbers share a key; none seen so far.
-                key: key_of(&serial.unwrap_or_else(|| {
-                    format!("{:04x}:{:04x}", desc.vendor_id(), desc.product_id())
-                })),
-                printer,
-                scanner,
-            };
-        // The device id names the model the way the network does ("DCP-1610W series").
-        if let Ok(id) = p.device_id()
-            && let Some(m) = device_id_field(&id, "MDL").or(device_id_field(&id, "MODEL"))
-        {
-            p.model = m.to_string();
+        let (mut serial, mut product, mut id) = (None, None, None);
+        if let Ok(h) = device.open() {
+            serial = h.read_serial_number_string_ascii(&desc).ok();
+            product = h.read_product_string_ascii(&desc).ok();
+            // Read without claiming the interface, so listing never gets in the way of a
+            // status call or a print job. Linux needs a claim here and falls back.
+            id = printer.and_then(|i| read_device_id(&h, i).ok());
         }
-        Some(p)
+        // The device id names the model the way the network does ("DCP-1610W series").
+        let model = id
+            .as_deref()
+            .and_then(|id| device_id_field(id, "MDL").or(device_id_field(id, "MODEL")))
+            .map(str::to_string)
+            .or(product)
+            .unwrap_or_else(|| format!("USB device {:04x}", desc.product_id()));
+        // ponytail: two printers without serial numbers share a key; none seen so far.
+        let serial =
+            serial.unwrap_or_else(|| format!("{:04x}:{:04x}", desc.vendor_id(), desc.product_id()));
+        Some(UsbPrinter {
+            device,
+            model,
+            key: key_of(&serial),
+            printer,
+            scanner,
+        })
     }
 
     /// The model from the device id's `MDL` field, e.g. `DCP-1610W series` (the USB
@@ -173,13 +170,7 @@ impl UsbPrinter {
     /// fields (`SN`, `SERN`, `SERIALNUMBER`) are removed.
     pub fn device_id(&self) -> io::Result<String> {
         let c = self.claim_printer()?;
-        let mut buf = [0u8; 1024];
-        let index = (c.iface.number as u16) << 8 | c.iface.alt as u16;
-        let n = c
-            .handle
-            .read_control(0xa1, 0, 0, index, &mut buf, CTRL_TIMEOUT)
-            .map_err(usb_io)?;
-        Ok(parse_device_id(&buf[..n]))
+        read_device_id(&c.handle, c.iface).map_err(usb_io)
     }
 
     /// IEEE 1284 port status (printer class request GET_PORT_STATUS).
@@ -288,6 +279,13 @@ impl UsbPrinter {
         }
         r
     }
+}
+
+fn read_device_id(h: &rusb::DeviceHandle<GlobalContext>, iface: Iface) -> rusb::Result<String> {
+    let mut buf = [0u8; 1024];
+    let index = (iface.number as u16) << 8 | iface.alt as u16;
+    let n = h.read_control(0xa1, 0, 0, index, &mut buf, CTRL_TIMEOUT)?;
+    Ok(parse_device_id(&buf[..n]))
 }
 
 /// FNV-1a over the serial, 48 bits as 12 hex digits. Stable across Rust versions, unlike

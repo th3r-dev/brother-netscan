@@ -106,7 +106,7 @@ printer.print(&job)?;                                   // a finished job, e.g. 
 
 The feature is off by default. It pulls in rusb with its `vendored` feature, so libusb is built from source and linked statically. Nothing has to be installed with Homebrew or apt.
 
-- `find()` lists every Brother device with a printer or scanner interface.
+- `find()` lists every Brother device with a printer or scanner interface. It claims no interface, so it never gets in the way of a scan, status call or print job.
 - `model()` comes from the device id's `MDL` field.
 - `key()` is a 12-digit hash of the USB serial number, short and stable. It exists so an app can tell printers apart without showing or storing the serial; the serial itself is never returned. `device_id()` drops `SN` fields too.
 - `scan_to`, `probe`, `device_id`, `port_status`, `pjl` and `print` each open the device, claim the one interface they need, and release it when done.
