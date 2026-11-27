@@ -1,0 +1,7 @@
+/target
+.DS_Store
+*.pnm
+*.pgm
+*.ppm
+*.jpg
+*.png
